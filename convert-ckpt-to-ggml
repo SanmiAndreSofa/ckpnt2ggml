@@ -1,0 +1,178 @@
+#convert-ckpt-to-ggml
+
+
+library(Rcpp)
+library(reticulate)
+library(jsonlite)
+library(torch)
+library(sentencepiece)
+
+
+#dir_model<-paste0(getwd(),"/","llamar/model/LLAMA MODEL/LLaMA/7B")     example 
+#ftype=1
+
+#rm(list = ls())
+parse_args <- function(dir_model,ftype) {
+  list(dir_model = dir_model, ftype = as.integer(ftype))
+}
+
+#function to pull object into R
+#address_hex_string <- "<0x0000023e6fa6d0e0>"
+#address_raw <- charToRaw(substr(address_hex_string,3,nchar(address_hex_string)))
+#convert raw to a pointer
+#address_ptr <- address_raw_to_SEXP(address_raw)
+#ob<-getObjectFromAddress(address_ptr)
+
+
+get_n_parts <- function(dim) {
+  mappings <- c("4096" = 1, "5120" = 2, "6656" = 4, "8192" = 8)
+  n_parts <- mappings[as.character(hparams$dim)]
+  if (is.na(n_parts)) {
+    stop(paste("Invalid dim:", dim))
+  }
+  cat("n_parts =", n_parts, "\n")
+  return(n_parts)
+}
+
+#load header parameters
+load_hparams_and_tokenizer <- function(dir_model) {
+  fname_hparams <- file.path(dir_model, "params.json") #this is in the json file for the specific model
+  fname_tokenizer <- file.path(dir_model, "..", "tokenizer.model") #path to the tokenizer.model
+  
+  hparams <- fromJSON(txt = fname_hparams)
+  print(hparams)
+  
+  tokenizer <- sentencepiece_load_model(fname_tokenizer) #sentencepieceprocessor goes here it returns a pointer to the token model
+  hparams[["vocab_size"]] <- tokenizer[["vocab_size"]]
+  
+  return(list(hparams = hparams, tokenizer = tokenizer)) #copy vocab size from tokenizer to hparams
+}
+
+
+write_header <- function(fout, hparams, ftype) {
+# dont create another variable to minimize memory use
+#  keys <- c("vocab_size", "dim", "multiple_of", "n_heads", "n_layers") 
+
+      values <- c(
+      0x67676d6c,  # magic: ggml in hex
+      hparams[["vocab_size"]],
+      hparams[["dim"]],
+      hparams[["multiple_of"]],
+      hparams[["n_heads"]],
+      hparams[["n_layers"]],
+      #unlist(hparams[keys]),
+      hparams[["dim"]]/hparams[["n_heads"]],  # rot (obsolete)
+      ftype)
+      
+#Write the values to the binary file
+  writeBin(values, con = fout, size = 4) #size = 4 because integer is 4bytes
+}
+
+write_tokens <- function(fout, tokenizer) {
+    for (i in 1:tokenizer$vocab_size) {
+    #if unknown token i.e. <unk>,translated as ?? then write u2047 in the file
+    if (tokenizer$vocabulary$subword[i] %in% "<unk>") { 
+            text <- charToRaw(" \u2047 ")
+
+    #else if control ("<s>","</s>")  tokens skip - dont write anything
+    } else if (tokenizer$vocabulary$subword[i] %in% c("</s>","<s>")) { #if control
+      text <- raw()
+      
+    #else if bytes "<U+XX>" tokens (which may be invalid UTF-8)
+    } else if ("<" %in% unlist(strsplit(tokenizer$vocabulary$subword[i],split=""))) { #if bytes
+      subword <- tokenizer$vocabulary$subword[i]
+      if (nchar(subword) != 6) {
+        cat(sprintf("Invalid token: %s\n", subword))
+        stop()
+      }
+      byte_value <- strtoi(substr(subword, 4, -1), base = 16)
+      text <- as.raw(byte_value) #convert to raw byte
+      
+      # normal token. Uses U+2581 (LOWER ONE EIGHTH BLOCK) to represent spaces.
+    } else {
+      text <- charToRaw(gsub("\u2581", " ", tokenizer$vocabulary$subword[i]))#replace special characters wih space
+    }
+    
+    writeBin(as.integer(length(text)), fout, size = 4,endian = .Platform$endian)
+    writeBin(text, fout,.Platform$endian)
+  }
+}
+
+process_and_write_variables <- function(fout, model, ftype) {
+  
+  #model will be loaded here
+  for (name in names(model)) {
+    if (endsWith(name, "freqs")) { #find the freqs
+      next
+    }
+
+    datao <- model[[name]] #extract the data in each
+    shape <- dim(datao) #dim of each or length of each
+    
+    cat(sprintf("Processing variable: %s with shape: %s and type: %s\n", name, toString(shape), typeof(datao)))
+    
+    data <- unlist(datao)
+    n_dims <- length(shape)
+    
+    # default type is fp16
+    ftype_cur <- 1
+    if (ftype == 0 || n_dims == 1) {
+      cat("  Converting to float32\n")
+      data <- as.numeric(data) #make into double precision this is where the issues lies.
+      ftype_cur <- 0
+    }
+    
+    # header
+    sname <- charToRaw(name)
+    writeBin(c(length(data), length(sname), ftype_cur), fout, size = 4,endian = .Platform$endian) #write the name of the layer
+    for (dim in rev(shape)) {
+      writeBin(dim, fout, size = 4,endian = .Platform$endian)
+    }
+    writeBin(sname, fout,endian = .Platform$endian)
+    
+    # data output to file
+    writeBin(data, fout,endian = .Platform$endian)
+  }
+}
+
+main <- function(dir_model,ftype) {
+  
+  ftype_str <- c("f32", "f16")
+  
+  result <- load_hparams_and_tokenizer(dir_model)
+  hparams <- result$hparams
+  tokenizer <- result$tokenizer
+  n_parts <- get_n_parts(dim=hparams$dim)
+  
+  for (p in seq_len(n_parts)){
+    
+    cat(paste0("Processing part",p,"\n",timestamp()))
+    fname_model<-paste0(dir_model,"/consolidated.0",p-1,".pth")
+    fname_out<-paste0(dir_model,"/ggml-model-",ftype_str[1+1],".bin",ifelse(p==1,"",paste0(".",p-1)))
+    
+    
+    state_dict<-torch::load_state_dict(fname_model)
+    #model<-torch::torch_load(fname_model,device = cpu)
+    
+    modell<-readRDS(state_dict$tok_embeddings.weight)
+    model<-unserialize(model)
+    model$to(device)
+    
+    torch
+    # open a connection for writing binary data
+    fout<-file(fname_out,open="wb") 
+    
+    write_header(fout = fout,hparams = hparams,ftype = ftype)
+    write_tokens(fout = fout,tokenizer = tokenizer)
+    process_and_write_variables(fout = fout,model = model,ftype = ftype)
+    close(fout)
+    rm(model)
+    cat(paste0("Done. Output file: ", fname_out,", (part ", p ,")\n",timestamp()))
+
+  }
+}
+
+
+
+main(dir_model,ftype)
+
